@@ -1,0 +1,41 @@
+# Keep the free Koyeb web service warm.
+#
+# Set this in GitHub: Settings -> Secrets and variables -> Actions -> Variables
+#   API_BASE_URL = https://<your-service>.koyeb.app
+#
+# The thin API exposes GET /health.
+
+name: Ping API
+
+on:
+  schedule:
+    # Every 14 minutes. Keeps Koyeb from scaling to zero without hammering it.
+    - cron: "*/14 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call /health
+        env:
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          if [ -z "$API_BASE_URL" ]; then
+            echo "::warning::API_BASE_URL is not set. Add it in Settings -> Secrets and variables -> Actions -> Variables."
+            exit 0
+          fi
+
+          URL="${API_BASE_URL%/}/health"
+          echo "Pinging $URL"
+
+          curl --fail --silent --show-error \
+            --retry 3 \
+            --retry-delay 10 \
+            --retry-connrefused \
+            --max-time 120 \
+            "$URL"
