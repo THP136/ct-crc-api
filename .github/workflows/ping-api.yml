@@ -19,7 +19,7 @@ permissions:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Call /health
         env:
@@ -34,8 +34,8 @@ jobs:
           echo "Pinging $URL"
 
           curl --fail --silent --show-error \
-            --retry 3 \
+            --retry 2 \
             --retry-delay 10 \
             --retry-connrefused \
-            --max-time 120 \
+            --max-time 90 \
             "$URL"
