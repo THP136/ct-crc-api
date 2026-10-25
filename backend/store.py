@@ -2,12 +2,116 @@ import json
 import logging
 import os
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .config import DATA_DIR, UTC7
 from .settings_schema import FIELDS, normalize_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _dec_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        text = format(Decimal(str(value)), "f")
+    except (InvalidOperation, ValueError):
+        return None
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _dec(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value or 0))
+    except (InvalidOperation, ValueError):
+        return Decimal(0)
+
+
+def _atomic_save_json_file(path, data: Any) -> None:
+    _ensure_dir()
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _section_snapshot(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "coin_qty": _dec_str(values.get("coin_qty")),
+        "quote_balance": _dec_str(values.get("quote_balance")),
+    }
+
+
+def _section_matches(section: dict[str, Any], snapshot: dict[str, Any] | None) -> bool:
+    if not snapshot:
+        return True
+    return (
+        _dec(section.get("coin_qty")) == _dec(snapshot.get("coin_qty"))
+        and _dec(section.get("quote_balance")) == _dec(snapshot.get("quote_balance"))
+    )
+
+
+def _apply_journal(op: dict[str, Any]) -> None:
+    """Finish one ledger operation using its before/after snapshots."""
+    after = op.get("section_after")
+    if after:
+        sections = _load_json_file(SECTIONS_FILE) or []
+        section = next((s for s in sections if s.get("id") == op.get("section_id")), None)
+        if section is not None:
+            if not _section_matches(section, after):
+                before = op.get("section_before")
+                if _section_matches(section, before):
+                    section["coin_qty"] = after.get("coin_qty")
+                    section["quote_balance"] = after.get("quote_balance")
+                    _atomic_save_json_file(SECTIONS_FILE, sections)
+                else:
+                    logger.warning(
+                        "ledger journal: section %s changed outside the journal",
+                        op.get("section_id"),
+                    )
+    order_fields = op.get("order_fields")
+    if order_fields:
+        orders = _load_json_file(TASK_ORDERS_FILE) or []
+        for order in orders:
+            if order.get("task_id") == op.get("task_id"):
+                order.update(order_fields)
+                _atomic_save_json_file(TASK_ORDERS_FILE, orders)
+                break
+    queue_after = op.get("queue_quote_budget")
+    if queue_after is not None:
+        queue = _load_json_file(TASK_QUEUE_FILE) or []
+        for task in queue:
+            if task.get("id") == op.get("task_id"):
+                task["quote_budget"] = queue_after
+                _atomic_save_json_file(TASK_QUEUE_FILE, queue)
+                break
+
+
+def _recover_journal() -> None:
+    op = _load_json_file(LEDGER_JOURNAL_FILE)
+    if not isinstance(op, dict):
+        return
+    try:
+        _apply_journal(op)
+    except Exception:
+        logger.exception("ledger journal recovery failed; keeping journal")
+        return
+    try:
+        LEDGER_JOURNAL_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _commit_journal(op: dict[str, Any]) -> None:
+    _atomic_save_json_file(LEDGER_JOURNAL_FILE, op)
+    _apply_journal(op)
+    try:
+        LEDGER_JOURNAL_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 TASK_ENGINE_STATE_FILE = DATA_DIR / "task_engine_state.json"
 TASK_QUEUE_FILE = DATA_DIR / "task_queue.json"
@@ -16,6 +120,7 @@ TASK_CLOSED_FILE = DATA_DIR / "task_closed.json"
 TASK_ORDERS_FILE = DATA_DIR / "task_orders.json"
 COMMANDS_FILE = DATA_DIR / "commands.json"
 WORKER_STATUS_FILE = DATA_DIR / "worker_status.json"
+LEDGER_JOURNAL_FILE = DATA_DIR / "ledger_journal.json"
 
 _task_queue_id_counter = 0
 
@@ -398,7 +503,8 @@ def create_section(symbol: str, name: str, x0: float, coin_qty: float,
         "name": name,
         "symbol": symbol.strip().upper(),
         "x0": x0,
-        "coin_qty": coin_qty,
+        "coin_qty": _dec_str(coin_qty) or "0",
+        "quote_balance": "0",
         "current_x": x0,
         "current_pct": 0.0,
         "seeded": True,
@@ -476,14 +582,21 @@ def load_task_queue_by_section(section_id: int) -> list[dict[str, Any]]:
 def add_task_to_queue_for_section(section_id: int, symbol: str, direction: str,
                                    target_pct: float, action: str, note: str,
                                    sibling_id: int | None = None,
-                                   sell_origin: str = "") -> dict[str, Any] | None:
+                                   sell_origin: str = "",
+                                   quote_budget: Any = None,
+                                   spawn_key: str | None = None) -> dict[str, Any] | None:
     if target_pct < -98 or target_pct > 98:
         return None
     if _use_db():
         from .db import add_task_to_queue_for_section as _add
-        return _add(section_id, symbol, direction, target_pct, action, note, sibling_id, sell_origin)
+        return _add(section_id, symbol, direction, target_pct, action, note,
+                    sibling_id, sell_origin, quote_budget, spawn_key)
     global _task_queue_id_counter
     data = _load_json_file(TASK_QUEUE_FILE) or []
+    if spawn_key:
+        existing = next((t for t in data if t.get("spawn_key") == spawn_key), None)
+        if existing:
+            return existing
     max_id = max((t.get("id", 0) for t in data), default=0)
     _task_queue_id_counter = max(max_id, _task_queue_id_counter) + 1
     task = {
@@ -496,9 +609,58 @@ def add_task_to_queue_for_section(section_id: int, symbol: str, direction: str,
         "sibling_id": sibling_id,
         "sell_origin": sell_origin,
         "section_id": section_id,
+        "quote_budget": _dec_str(quote_budget) if quote_budget is not None else None,
+        "spawn_key": spawn_key or "",
     }
     data.append(task)
     _save_json_file(TASK_QUEUE_FILE, data)
+    return task
+
+
+def create_buy_task_reserving_quote(section_id: int, symbol: str, direction: str,
+                                    target_pct: float, note: str,
+                                    sell_origin: str = "",
+                                    spawn_key: str | None = None,
+                                    sibling_id: int | None = None
+                                    ) -> dict[str, Any] | None:
+    if _use_db():
+        from .db import create_buy_task_reserving_quote as _create
+        return _create(section_id, symbol, direction, target_pct, note,
+                       sell_origin, spawn_key, sibling_id)
+    if target_pct < -98 or target_pct > 98:
+        return None
+    global _task_queue_id_counter
+    queue = _load_json_file(TASK_QUEUE_FILE) or []
+    if spawn_key:
+        existing = next((t for t in queue if t.get("spawn_key") == spawn_key), None)
+        if existing:
+            return existing
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return None
+    budget = _dec(section.get("quote_balance"))
+    if budget <= 0:
+        return None
+    section["quote_balance"] = "0"
+    _save_json_file(SECTIONS_FILE, sections)
+    max_id = max((t.get("id", 0) for t in queue), default=0)
+    _task_queue_id_counter = max(max_id, _task_queue_id_counter) + 1
+    task = {
+        "id": _task_queue_id_counter,
+        "symbol": symbol.strip().upper(),
+        "direction": direction,
+        "target_pct": target_pct,
+        "action": "BUY",
+        "note": note,
+        "sibling_id": sibling_id,
+        "sell_origin": sell_origin,
+        "section_id": section_id,
+        "quote_budget": _dec_str(budget),
+        "spawn_key": spawn_key or "",
+    }
+    queue.append(task)
+    _save_json_file(TASK_QUEUE_FILE, queue)
     return task
 
 
@@ -511,6 +673,11 @@ def add_passed_task_for_section(section_id: int, symbol: str, direction: str,
         from .db import add_passed_task_for_section as _add
         return _add(section_id, symbol, direction, action, target_pct, hit_pct, hit_price, note, task_id, sell_origin)
     data = _load_json_file(TASK_PASSED_FILE) or []
+    if task_id is not None and any(
+        t.get("section_id") == section_id and t.get("task_id") == task_id
+        for t in data
+    ):
+        return
     data.insert(0, {
         "symbol": symbol.strip().upper(),
         "task_id": task_id,
@@ -545,6 +712,9 @@ def add_closed_task_for_section(section_id: int, symbol: str, closed_task_id: in
         return _add(section_id, symbol, closed_task_id, sibling_triggered_id,
                     direction, action, target_pct, at_pct, at_price, reason, note)
     data = _load_json_file(TASK_CLOSED_FILE) or []
+    if any(t.get("section_id") == section_id and t.get("closed_task_id") == closed_task_id
+           for t in data):
+        return
     data.insert(0, {
         "symbol": symbol.strip().upper(),
         "closed_task_id": closed_task_id,
@@ -585,6 +755,7 @@ def load_section_info_batched(section_id: int) -> dict[str, Any]:
 # --------------- Price History ---------------
 
 PRICE_HISTORY_FILE = DATA_DIR / "price_history.json"
+DAILY_REPORTS_FILE = DATA_DIR / "daily_reports.json"
 
 
 def add_price_history(symbol: str, price: float) -> None:
@@ -639,14 +810,199 @@ def delete_engine(symbol: str) -> None:
     _save_json_file(PRICE_HISTORY_FILE, history)
 
 
+# --------------- Section ledger / accounting ---------------
+
+def adjust_section_balances(section_id: int, base_delta: Any,
+                            quote_delta: Any) -> dict[str, Any]:
+    if _use_db():
+        from .db import adjust_section_balances as _adjust
+        return _adjust(section_id, base_delta, quote_delta)
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return {"coin_qty": "0", "quote_balance": "0", "clamped": False}
+    coin = _dec(section.get("coin_qty")) + _dec(base_delta)
+    quote = _dec(section.get("quote_balance")) + _dec(quote_delta)
+    clamped = coin < 0
+    if clamped:
+        logger.warning("section %s oversell clamped to 0", section_id)
+        coin = Decimal(0)
+    section["coin_qty"] = _dec_str(coin)
+    section["quote_balance"] = _dec_str(quote)
+    _save_json_file(SECTIONS_FILE, sections)
+    return {
+        "coin_qty": _dec_str(coin),
+        "quote_balance": _dec_str(quote),
+        "clamped": clamped,
+    }
+
+
+def reserve_section_quote(section_id: int, amount: Any) -> bool:
+    if _use_db():
+        from .db import reserve_section_quote as _reserve
+        return _reserve(section_id, amount)
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return False
+    balance = _dec(section.get("quote_balance"))
+    wanted = _dec(amount)
+    if balance < wanted:
+        return False
+    section["quote_balance"] = _dec_str(balance - wanted)
+    _save_json_file(SECTIONS_FILE, sections)
+    return True
+
+
+def add_section_quote(section_id: int, amount: Any) -> None:
+    if _use_db():
+        from .db import add_section_quote as _add
+        return _add(section_id, amount)
+    sections = _load_json_file(SECTIONS_FILE) or []
+    for section in sections:
+        if section.get("id") == section_id:
+            section["quote_balance"] = _dec_str(_dec(section.get("quote_balance")) + _dec(amount))
+            break
+    _save_json_file(SECTIONS_FILE, sections)
+
+
+def apply_order_accounting(task_id: int, base_delta: Any, quote_delta: Any,
+                           aggregates: dict[str, Any] | None = None) -> bool:
+    if _use_db():
+        from .db import apply_order_accounting as _apply
+        return _apply(task_id, base_delta, quote_delta, aggregates)
+    _recover_journal()
+    aggregates = aggregates or {}
+    orders = _load_json_file(TASK_ORDERS_FILE) or []
+    order = next((o for o in orders if o.get("task_id") == task_id), None)
+    if order is None or order.get("accounting_applied_at"):
+        return False
+    section_id = order.get("section_id")
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return False
+    before = _section_snapshot(section)
+    coin = _dec(section.get("coin_qty")) + _dec(base_delta)
+    quote = _dec(section.get("quote_balance")) + _dec(quote_delta)
+    clamped = coin < 0
+    if clamped:
+        logger.warning("section %s oversell clamped to 0", section_id)
+        coin = Decimal(0)
+    after = {"coin_qty": _dec_str(coin), "quote_balance": _dec_str(quote)}
+
+    status = str(aggregates.get("accounting_status") or "OK")
+    if clamped and status != "NEEDS_REVIEW":
+        status = "NEEDS_REVIEW"
+    order_fields: dict[str, Any] = {
+        "fee_base": _dec_str(aggregates.get("fee_base") or 0),
+        "fee_quote": _dec_str(aggregates.get("fee_quote") or 0),
+        "fee_other": _dec_str(aggregates.get("fee_other") or 0),
+        "fee_other_currency": aggregates.get("fee_other_currency") or "",
+        "accounting_status": status,
+        "accounting_applied_at": _ts(),
+        "updated_at": _ts(),
+    }
+    for field in ("filled_base", "filled_quote", "quote_spent"):
+        if aggregates.get(field) is not None:
+            order_fields[field] = _dec_str(aggregates[field])
+    _commit_journal({
+        "kind": "accounting",
+        "task_id": task_id,
+        "section_id": section_id,
+        "section_before": before,
+        "section_after": after,
+        "order_fields": order_fields,
+    })
+    return True
+
+
+def settle_buy_order(task_id: int) -> dict[str, Any] | None:
+    if _use_db():
+        from .db import settle_buy_order as _settle
+        return _settle(task_id)
+    _recover_journal()
+    orders = _load_json_file(TASK_ORDERS_FILE) or []
+    order = next((o for o in orders if o.get("task_id") == task_id), None)
+    if order is None or order.get("quote_settled_at"):
+        return None
+    section_id = order.get("section_id")
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return None
+    budget = _dec(order.get("quote_budget"))
+    spent = _dec(order.get("quote_spent"))
+    leftover = budget - spent
+    if leftover < 0:
+        leftover = Decimal(0)
+    before = _section_snapshot(section)
+    quote_after = _dec(section.get("quote_balance")) + leftover
+    order_fields: dict[str, Any] = {
+        "quote_settled_at": _ts(),
+        "updated_at": _ts(),
+    }
+    if spent > budget:
+        order_fields["accounting_status"] = "NEEDS_REVIEW"
+    _commit_journal({
+        "kind": "settle",
+        "task_id": task_id,
+        "section_id": section_id,
+        "section_before": before,
+        "section_after": {"coin_qty": before.get("coin_qty"),
+                          "quote_balance": _dec_str(quote_after)},
+        "order_fields": order_fields,
+        "queue_quote_budget": "0",
+    })
+    return {"task_id": task_id, "released": _dec_str(leftover)}
+
+
+def release_buy_task_budget(task_id: int) -> str | None:
+    if _use_db():
+        from .db import release_buy_task_budget as _release
+        return _release(task_id)
+    _recover_journal()
+    orders = _load_json_file(TASK_ORDERS_FILE) or []
+    if any(o.get("task_id") == task_id for o in orders):
+        return None
+    queue = _load_json_file(TASK_QUEUE_FILE) or []
+    task = next((t for t in queue if t.get("id") == task_id), None)
+    if task is None or str(task.get("action") or "").upper() != "BUY":
+        return None
+    budget = _dec(task.get("quote_budget"))
+    if budget <= 0:
+        return None
+    section_id = task.get("section_id")
+    sections = _load_json_file(SECTIONS_FILE) or []
+    section = next((s for s in sections if s.get("id") == section_id), None)
+    if section is None:
+        return None
+    before = _section_snapshot(section)
+    quote_after = _dec(section.get("quote_balance")) + budget
+    _commit_journal({
+        "kind": "release",
+        "task_id": task_id,
+        "section_id": section_id,
+        "section_before": before,
+        "section_after": {"coin_qty": before.get("coin_qty"),
+                          "quote_balance": _dec_str(quote_after)},
+        "queue_quote_budget": "0",
+    })
+    return _dec_str(budget)
+
+
 # --------------- Task Orders ---------------
 
 ORDER_FIELDS = (
     "task_id", "section_id", "symbol", "exchange_symbol", "client_order_id",
     "exchange_order_id", "side", "direction", "order_type", "amount", "price",
     "stop_price", "target_pct", "target_price", "sell_origin", "status",
-    "filled_amount", "avg_fill_price", "attempts", "next_retry_at",
-    "last_error", "last_synced_at", "completed_at",
+    "filled_amount", "avg_fill_price", "filled_base", "filled_quote",
+    "fee_base", "fee_quote", "fee_other", "fee_other_currency",
+    "quote_budget", "quote_spent", "quote_settled_at",
+    "trades_synced_filled", "accounting_status", "accounting_applied_at",
+    "attempts", "next_retry_at", "last_error", "last_synced_at",
+    "completed_at", "filled_at",
 )
 ACTIVE_ORDER_STATUSES = ("PENDING", "OPEN", "PARTIALLY_FILLED", "UNKNOWN")
 FINAL_ORDER_STATUSES = ("FILLED", "CANCELED", "REJECTED", "NEEDS_REVIEW")
@@ -654,6 +1010,11 @@ FINAL_ORDER_STATUSES = ("FILLED", "CANCELED", "REJECTED", "NEEDS_REVIEW")
 _NUMERIC_ORDER_FIELDS = (
     "amount", "price", "stop_price", "target_pct", "target_price",
     "filled_amount", "avg_fill_price",
+)
+
+_MONEY_ORDER_FIELDS = (
+    "filled_base", "filled_quote", "fee_base", "fee_quote", "fee_other",
+    "quote_budget", "quote_spent", "trades_synced_filled",
 )
 
 
@@ -676,6 +1037,20 @@ def _normalize_order(data: dict[str, Any]) -> dict[str, Any]:
             rec[field] = float(value)
         except (TypeError, ValueError):
             rec[field] = None
+    for field in _MONEY_ORDER_FIELDS:
+        rec[field] = _dec_str(rec.get(field))
+    if rec.get("fee_base") is None:
+        rec["fee_base"] = "0"
+    if rec.get("fee_quote") is None:
+        rec["fee_quote"] = "0"
+    if rec.get("fee_other") is None:
+        rec["fee_other"] = "0"
+    if rec.get("quote_spent") is None:
+        rec["quote_spent"] = "0"
+    if rec.get("trades_synced_filled") is None:
+        rec["trades_synced_filled"] = "0"
+    rec["fee_other_currency"] = rec.get("fee_other_currency") or ""
+    rec["accounting_status"] = rec.get("accounting_status") or "PENDING"
     try:
         rec["attempts"] = int(rec.get("attempts") or 0)
     except (TypeError, ValueError):
@@ -685,6 +1060,7 @@ def _normalize_order(data: dict[str, Any]) -> dict[str, Any]:
     rec["section_id"] = int(rec["section_id"]) if rec.get("section_id") is not None else None
     rec["task_id"] = int(rec["task_id"]) if rec.get("task_id") is not None else None
     for field in ("next_retry_at", "last_synced_at", "completed_at",
+                  "filled_at", "quote_settled_at", "accounting_applied_at",
                   "created_at", "updated_at"):
         value = rec.get(field)
         if value is None:
@@ -747,6 +1123,85 @@ def list_orders(symbol: str | None = None, section_id: int | None = None,
             continue
         out.append(rec)
     return out
+
+
+def _order_event_time(rec: dict[str, Any], fields: tuple[str, ...]) -> datetime | None:
+    for field in fields:
+        value = rec.get(field)
+        if not value:
+            continue
+        if isinstance(value, datetime):
+            return value
+        try:
+            return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def list_filled_orders_between(start: datetime, end: datetime) -> list[dict[str, Any]]:
+    if _use_db():
+        from .db import list_filled_orders_between as _list
+        return _list(start, end)
+    fields = ("filled_at", "last_synced_at", "completed_at", "created_at")
+    out = []
+    for row in _load_json_file(TASK_ORDERS_FILE) or []:
+        rec = _normalize_order(row)
+        if rec.get("status") != "FILLED":
+            continue
+        ts = _order_event_time(rec, fields)
+        if ts is None or not (start <= ts < end):
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: _order_event_time(r, fields) or start)
+    return out
+
+
+def list_partial_orders_between(start: datetime, end: datetime) -> list[dict[str, Any]]:
+    if _use_db():
+        from .db import list_partial_orders_between as _list
+        return _list(start, end)
+    fields = ("filled_at", "last_synced_at", "updated_at", "created_at")
+    out = []
+    for row in _load_json_file(TASK_ORDERS_FILE) or []:
+        rec = _normalize_order(row)
+        if rec.get("status") == "FILLED":
+            continue
+        try:
+            filled = float(rec.get("filled_amount") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled <= 0:
+            continue
+        ts = _order_event_time(rec, fields)
+        if ts is None or not (start <= ts < end):
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: _order_event_time(r, fields) or start)
+    return out
+
+
+def load_daily_report(report_date: Any) -> dict[str, Any] | None:
+    if _use_db():
+        from .db import load_daily_report as _load
+        return _load(report_date)
+    data = _load_json_file(DAILY_REPORTS_FILE) or {}
+    return data.get(str(report_date))
+
+
+def save_daily_report(report_date: Any, status: str = "SENT",
+                      error: str = "") -> None:
+    if _use_db():
+        from .db import save_daily_report as _save
+        return _save(report_date, status, error)
+    data = _load_json_file(DAILY_REPORTS_FILE) or {}
+    data[str(report_date)] = {
+        "report_date": str(report_date),
+        "status": status,
+        "sent_at": _ts(),
+        "error": error or "",
+    }
+    _atomic_save_json_file(DAILY_REPORTS_FILE, data)
 
 
 def load_active_orders() -> list[dict[str, Any]]:

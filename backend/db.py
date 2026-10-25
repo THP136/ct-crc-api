@@ -4,11 +4,25 @@ import os
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .config import UTC7
 
 logger = logging.getLogger(__name__)
+
+
+def _dec_str(value: Any) -> str | None:
+    """Serialize a NUMERIC to a plain decimal string without exponent."""
+    if value is None:
+        return None
+    try:
+        text = format(Decimal(str(value)), "f")
+    except (InvalidOperation, ValueError):
+        return None
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -101,6 +115,9 @@ def init_schema() -> None:
                 action VARCHAR(10) NOT NULL DEFAULT 'BUY',
                 note TEXT DEFAULT '',
                 sibling_id INTEGER,
+                sell_origin VARCHAR(20) DEFAULT '',
+                quote_budget NUMERIC,
+                spawn_key VARCHAR(100),
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -113,6 +130,18 @@ def init_schema() -> None:
             cur.execute("ALTER TABLE crypto_task_queue ADD COLUMN IF NOT EXISTS sell_origin VARCHAR(20) DEFAULT ''")
         except Exception:
             pass
+        try:
+            cur.execute("ALTER TABLE crypto_task_queue ADD COLUMN IF NOT EXISTS quote_budget NUMERIC")
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE crypto_task_queue ADD COLUMN IF NOT EXISTS spawn_key VARCHAR(100)")
+        except Exception:
+            pass
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_crypto_task_queue_spawn_key "
+            "ON crypto_task_queue(spawn_key) WHERE spawn_key IS NOT NULL"
+        )
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_task_passed (
                 id SERIAL PRIMARY KEY,
@@ -206,6 +235,7 @@ def init_schema() -> None:
                 symbol VARCHAR(20) NOT NULL,
                 x0 NUMERIC NOT NULL,
                 coin_qty NUMERIC NOT NULL DEFAULT 0,
+                quote_balance NUMERIC NOT NULL DEFAULT 0,
                 current_x NUMERIC NOT NULL,
                 current_pct NUMERIC NOT NULL DEFAULT 0,
                 seeded BOOLEAN NOT NULL DEFAULT FALSE,
@@ -215,6 +245,10 @@ def init_schema() -> None:
         """)
         try:
             cur.execute("ALTER TABLE crypto_sections ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)")
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE crypto_sections ADD COLUMN IF NOT EXISTS quote_balance NUMERIC NOT NULL DEFAULT 0")
         except Exception:
             pass
         cur.execute(
@@ -248,6 +282,15 @@ def init_schema() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_price_history_at ON crypto_price_history(created_at DESC);")
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_daily_reports (
+                report_date DATE PRIMARY KEY,
+                status VARCHAR(20) NOT NULL DEFAULT 'SENT',
+                sent_at TIMESTAMP,
+                error TEXT DEFAULT ''
+            );
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_task_orders (
                 id SERIAL PRIMARY KEY,
                 task_id INTEGER NOT NULL UNIQUE,
@@ -268,11 +311,24 @@ def init_schema() -> None:
                 status VARCHAR(24) NOT NULL DEFAULT 'PENDING',
                 filled_amount NUMERIC NOT NULL DEFAULT 0,
                 avg_fill_price NUMERIC,
+                filled_base NUMERIC,
+                filled_quote NUMERIC,
+                fee_base NUMERIC NOT NULL DEFAULT 0,
+                fee_quote NUMERIC NOT NULL DEFAULT 0,
+                fee_other NUMERIC NOT NULL DEFAULT 0,
+                fee_other_currency VARCHAR(20) DEFAULT '',
+                quote_budget NUMERIC,
+                quote_spent NUMERIC NOT NULL DEFAULT 0,
+                quote_settled_at TIMESTAMP,
+                trades_synced_filled NUMERIC NOT NULL DEFAULT 0,
+                accounting_status VARCHAR(20) DEFAULT 'PENDING',
+                accounting_applied_at TIMESTAMP,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_retry_at TIMESTAMP,
                 last_error TEXT DEFAULT '',
                 last_synced_at TIMESTAMP,
                 completed_at TIMESTAMP,
+                filled_at TIMESTAMP,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -280,6 +336,30 @@ def init_schema() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_task_orders_section ON crypto_task_orders(section_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_task_orders_symbol ON crypto_task_orders(symbol);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_task_orders_status ON crypto_task_orders(status);")
+        for column, ddl in (
+            ("filled_base", "NUMERIC"),
+            ("filled_quote", "NUMERIC"),
+            ("fee_base", "NUMERIC NOT NULL DEFAULT 0"),
+            ("fee_quote", "NUMERIC NOT NULL DEFAULT 0"),
+            ("fee_other", "NUMERIC NOT NULL DEFAULT 0"),
+            ("fee_other_currency", "VARCHAR(20) DEFAULT ''"),
+            ("quote_budget", "NUMERIC"),
+            ("quote_spent", "NUMERIC NOT NULL DEFAULT 0"),
+            ("quote_settled_at", "TIMESTAMP"),
+            ("trades_synced_filled", "NUMERIC NOT NULL DEFAULT 0"),
+            ("accounting_status", "VARCHAR(20) DEFAULT 'PENDING'"),
+            ("accounting_applied_at", "TIMESTAMP"),
+            ("filled_at", "TIMESTAMP"),
+        ):
+            try:
+                cur.execute(
+                    f"ALTER TABLE crypto_task_orders ADD COLUMN IF NOT EXISTS {column} {ddl}"
+                )
+            except Exception:
+                pass
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_task_orders_filled_at ON crypto_task_orders(filled_at);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_task_orders_updated_at ON crypto_task_orders(updated_at);")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_commands (
@@ -384,7 +464,7 @@ def load_task_queue(symbol: str) -> list[dict[str, Any]]:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin FROM crypto_task_queue WHERE UPPER(symbol) = UPPER(%s)",
+                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, quote_budget, spawn_key FROM crypto_task_queue WHERE UPPER(symbol) = UPPER(%s)",
                 (symbol.strip(),),
             )
             for row in cur.fetchall():
@@ -397,6 +477,8 @@ def load_task_queue(symbol: str) -> list[dict[str, Any]]:
                     "note": row[5] or "",
                     "sibling_id": row[6],
                     "sell_origin": row[7] or "",
+                    "quote_budget": _dec_str(row[8]),
+                    "spawn_key": row[9] or "",
                 })
     except Exception as e:
         logger.warning("db load_task_queue: %s", e)
@@ -448,7 +530,7 @@ def load_task_by_id(task_id: int) -> dict[str, Any] | None:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id "
+                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id, quote_budget, spawn_key "
                 "FROM crypto_task_queue WHERE id = %s",
                 (task_id,),
             )
@@ -465,6 +547,8 @@ def load_task_by_id(task_id: int) -> dict[str, Any] | None:
                 "sibling_id": row[6],
                 "sell_origin": row[7] or "",
                 "section_id": row[8],
+                "quote_budget": _dec_str(row[9]),
+                "spawn_key": row[10] or "",
             }
     except Exception as e:
         logger.warning("db load_task_by_id: %s", e)
@@ -689,7 +773,7 @@ def load_engine_info_batched(symbol: str) -> dict[str, Any]:
                 }
 
             cur.execute(
-                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin FROM crypto_task_queue WHERE UPPER(symbol) = UPPER(%s)",
+                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, quote_budget, spawn_key FROM crypto_task_queue WHERE UPPER(symbol) = UPPER(%s)",
                 (sym,),
             )
             for row in cur.fetchall():
@@ -698,6 +782,8 @@ def load_engine_info_batched(symbol: str) -> dict[str, Any]:
                     "target_pct": float(row[3]), "action": row[4],
                     "note": row[5] or "", "sibling_id": row[6],
                     "sell_origin": row[7] or "",
+                    "quote_budget": _dec_str(row[8]),
+                    "spawn_key": row[9] or "",
                 })
 
             cur.execute(
@@ -844,7 +930,8 @@ def create_section(symbol: str, name: str, x0: float, coin_qty: float,
             row = cur.fetchone()
             return {
                 "id": row[0], "name": name, "symbol": symbol.strip().upper(),
-                "x0": x0, "coin_qty": coin_qty, "current_x": x0,
+                "x0": x0, "coin_qty": _dec_str(coin_qty) or "0",
+                "quote_balance": "0", "current_x": x0,
                 "current_pct": 0.0, "seeded": True,
                 "request_id": request_id,
             }
@@ -860,7 +947,7 @@ def load_section_by_request_id(request_id: str) -> dict[str, Any] | None:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, name, symbol, x0, coin_qty, current_x, current_pct, seeded "
+                "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded "
                 "FROM crypto_sections WHERE request_id = %s",
                 (request_id,),
             )
@@ -869,9 +956,10 @@ def load_section_by_request_id(request_id: str) -> dict[str, Any] | None:
                 return None
             return {
                 "id": row[0], "name": row[1], "symbol": row[2],
-                "x0": float(row[3]), "coin_qty": float(row[4]),
-                "current_x": float(row[5]), "current_pct": float(row[6]),
-                "seeded": bool(row[7]),
+                "x0": float(row[3]), "coin_qty": _dec_str(row[4]) or "0",
+                "quote_balance": _dec_str(row[5]) or "0",
+                "current_x": float(row[6]), "current_pct": float(row[7]),
+                "seeded": bool(row[8]),
             }
     except Exception as e:
         logger.warning("db load_section_by_request_id: %s", e)
@@ -885,17 +973,18 @@ def load_sections(symbol: str | None = None) -> list[dict[str, Any]]:
         with _cursor() as cur:
             if symbol:
                 cur.execute(
-                    "SELECT id, name, symbol, x0, coin_qty, current_x, current_pct, seeded FROM crypto_sections WHERE UPPER(symbol) = UPPER(%s) ORDER BY id",
+                    "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE UPPER(symbol) = UPPER(%s) ORDER BY id",
                     (symbol.strip(),),
                 )
             else:
-                cur.execute("SELECT id, name, symbol, x0, coin_qty, current_x, current_pct, seeded FROM crypto_sections ORDER BY symbol, id")
+                cur.execute("SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections ORDER BY symbol, id")
             for row in cur.fetchall():
                 out.append({
                     "id": row[0], "name": row[1], "symbol": row[2],
-                    "x0": float(row[3]), "coin_qty": float(row[4]),
-                    "current_x": float(row[5]), "current_pct": float(row[6]),
-                    "seeded": bool(row[7]),
+                    "x0": float(row[3]), "coin_qty": _dec_str(row[4]) or "0",
+                    "quote_balance": _dec_str(row[5]) or "0",
+                    "current_x": float(row[6]), "current_pct": float(row[7]),
+                    "seeded": bool(row[8]),
                 })
     except Exception as e:
         logger.warning("db load_sections: %s", e)
@@ -907,7 +996,7 @@ def load_section(section_id: int) -> dict[str, Any] | None:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, name, symbol, x0, coin_qty, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
+                "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
                 (section_id,),
             )
             row = cur.fetchone()
@@ -915,9 +1004,10 @@ def load_section(section_id: int) -> dict[str, Any] | None:
                 return None
             return {
                 "id": row[0], "name": row[1], "symbol": row[2],
-                "x0": float(row[3]), "coin_qty": float(row[4]),
-                "current_x": float(row[5]), "current_pct": float(row[6]),
-                "seeded": bool(row[7]),
+                "x0": float(row[3]), "coin_qty": _dec_str(row[4]) or "0",
+                "quote_balance": _dec_str(row[5]) or "0",
+                "current_x": float(row[6]), "current_pct": float(row[7]),
+                "seeded": bool(row[8]),
             }
     except Exception as e:
         logger.warning("db load_section: %s", e)
@@ -953,41 +1043,68 @@ def load_task_queue_by_section(section_id: int) -> list[dict[str, Any]]:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id FROM crypto_task_queue WHERE section_id = %s",
+                f"{_TASK_SELECT} WHERE section_id = %s",
                 (section_id,),
             )
             for row in cur.fetchall():
-                out.append({
-                    "id": row[0], "symbol": row[1], "direction": row[2],
-                    "target_pct": float(row[3]), "action": row[4],
-                    "note": row[5] or "", "sibling_id": row[6],
-                    "sell_origin": row[7] or "", "section_id": row[8],
-                })
+                out.append(_task_row_to_dict(row))
     except Exception as e:
         logger.warning("db load_task_queue_by_section: %s", e)
     return out
 
 
+def _task_row_to_dict(row) -> dict[str, Any]:
+    return {
+        "id": row[0], "symbol": row[1], "direction": row[2],
+        "target_pct": float(row[3]), "action": row[4],
+        "note": row[5] or "", "sibling_id": row[6],
+        "sell_origin": row[7] or "", "section_id": row[8],
+        "quote_budget": _dec_str(row[9]), "spawn_key": row[10] or "",
+    }
+
+
+_TASK_SELECT = (
+    "SELECT id, symbol, direction, target_pct, action, note, sibling_id, "
+    "sell_origin, section_id, quote_budget, spawn_key FROM crypto_task_queue"
+)
+
+
 def add_task_to_queue_for_section(section_id: int, symbol: str, direction: str,
                                    target_pct: float, action: str, note: str,
                                    sibling_id: int | None = None,
-                                   sell_origin: str = "") -> dict[str, Any] | None:
+                                   sell_origin: str = "",
+                                   quote_budget: Any = None,
+                                   spawn_key: str | None = None) -> dict[str, Any] | None:
     if target_pct < -98 or target_pct > 98:
         return None
     try:
         init_schema()
         with _cursor() as cur:
+            if spawn_key:
+                cur.execute(f"{_TASK_SELECT} WHERE spawn_key = %s", (spawn_key,))
+                existing = cur.fetchone()
+                if existing is not None:
+                    return _task_row_to_dict(existing)
             cur.execute(
-                "INSERT INTO crypto_task_queue (symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                (symbol.strip().upper(), direction, target_pct, action, note, sibling_id, sell_origin, section_id),
+                """INSERT INTO crypto_task_queue
+                   (symbol, direction, target_pct, action, note, sibling_id,
+                    sell_origin, section_id, quote_budget, spawn_key)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT DO NOTHING
+                   RETURNING id, symbol, direction, target_pct, action, note,
+                             sibling_id, sell_origin, section_id, quote_budget, spawn_key""",
+                (symbol.strip().upper(), direction, target_pct, action, note,
+                 sibling_id, sell_origin, section_id,
+                 _dec_str(quote_budget) if quote_budget is not None else None,
+                 spawn_key or None),
             )
             row = cur.fetchone()
-            return {
-                "id": row[0], "symbol": symbol.strip().upper(),
-                "direction": direction, "target_pct": target_pct,
-                "action": action, "note": note, "sibling_id": sibling_id,
-                "sell_origin": sell_origin, "section_id": section_id,
-            }
+            if row is None and spawn_key:
+                cur.execute(f"{_TASK_SELECT} WHERE spawn_key = %s", (spawn_key,))
+                row = cur.fetchone()
+            if row is None:
+                return None
+            return _task_row_to_dict(row)
     except Exception as e:
         logger.warning("db add_task_to_queue_for_section: %s", e)
         return None
@@ -1001,6 +1118,13 @@ def add_passed_task_for_section(section_id: int, symbol: str, direction: str,
     try:
         init_schema()
         with _cursor() as cur:
+            if task_id is not None:
+                cur.execute(
+                    "SELECT 1 FROM crypto_task_passed WHERE section_id = %s AND task_id = %s LIMIT 1",
+                    (section_id, task_id),
+                )
+                if cur.fetchone() is not None:
+                    return
             cur.execute(
                 """INSERT INTO crypto_task_passed (symbol, task_id, direction, action, target_pct, hit_pct, hit_price, note, sell_origin, section_id, created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -1044,6 +1168,12 @@ def add_closed_task_for_section(section_id: int, symbol: str, closed_task_id: in
     try:
         init_schema()
         with _cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM crypto_task_closed WHERE section_id = %s AND closed_task_id = %s LIMIT 1",
+                (section_id, closed_task_id),
+            )
+            if cur.fetchone() is not None:
+                return
             cur.execute(
                 """INSERT INTO crypto_task_closed
                    (symbol, closed_task_id, sibling_triggered_id, direction, action,
@@ -1092,29 +1222,25 @@ def load_section_info_batched(section_id: int) -> dict[str, Any]:
         init_schema()
         with _cursor() as cur:
             cur.execute(
-                "SELECT id, name, symbol, x0, coin_qty, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
+                "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
                 (section_id,),
             )
             row = cur.fetchone()
             if row:
                 result["section"] = {
                     "id": row[0], "name": row[1], "symbol": row[2],
-                    "x0": float(row[3]), "coin_qty": float(row[4]),
-                    "current_x": float(row[5]), "current_pct": float(row[6]),
-                    "seeded": bool(row[7]),
+                    "x0": float(row[3]), "coin_qty": _dec_str(row[4]) or "0",
+                    "quote_balance": _dec_str(row[5]) or "0",
+                    "current_x": float(row[6]), "current_pct": float(row[7]),
+                    "seeded": bool(row[8]),
                 }
 
             cur.execute(
-                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id FROM crypto_task_queue WHERE section_id = %s",
+                "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id, quote_budget, spawn_key FROM crypto_task_queue WHERE section_id = %s",
                 (section_id,),
             )
             for row in cur.fetchall():
-                result["tasks"].append({
-                    "id": row[0], "symbol": row[1], "direction": row[2],
-                    "target_pct": float(row[3]), "action": row[4],
-                    "note": row[5] or "", "sibling_id": row[6],
-                    "sell_origin": row[7] or "", "section_id": row[8],
-                })
+                result["tasks"].append(_task_row_to_dict(row))
 
             cur.execute(
                 """SELECT id, symbol, direction, action, target_pct, hit_pct, hit_price, note, created_at, task_id, sell_origin, section_id
@@ -1212,9 +1338,22 @@ ORDER_COLUMNS = (
     "id", "task_id", "section_id", "symbol", "exchange_symbol",
     "client_order_id", "exchange_order_id", "side", "direction", "order_type",
     "amount", "price", "stop_price", "target_pct", "target_price",
-    "sell_origin", "status", "filled_amount", "avg_fill_price", "attempts",
-    "next_retry_at", "last_error", "last_synced_at", "completed_at",
-    "created_at", "updated_at",
+    "sell_origin", "status", "filled_amount", "avg_fill_price",
+    "filled_base", "filled_quote", "fee_base", "fee_quote", "fee_other",
+    "fee_other_currency", "quote_budget", "quote_spent", "quote_settled_at",
+    "trades_synced_filled", "accounting_status", "accounting_applied_at",
+    "attempts", "next_retry_at", "last_error", "last_synced_at",
+    "completed_at", "filled_at", "created_at", "updated_at",
+)
+
+_MONEY_ORDER_FIELDS = (
+    "filled_base", "filled_quote", "fee_base", "fee_quote", "fee_other",
+    "quote_budget", "quote_spent", "trades_synced_filled",
+)
+
+_ORDER_TIMESTAMP_FIELDS = (
+    "next_retry_at", "last_synced_at", "completed_at", "filled_at",
+    "quote_settled_at", "accounting_applied_at", "created_at", "updated_at",
 )
 
 _NUMERIC_ORDER_FIELDS = (
@@ -1235,11 +1374,14 @@ def _order_row(row) -> dict[str, Any]:
     out = dict(zip(ORDER_COLUMNS, row))
     for field in _NUMERIC_ORDER_FIELDS:
         out[field] = float(out[field]) if out.get(field) is not None else None
+    for field in _MONEY_ORDER_FIELDS:
+        out[field] = _dec_str(out.get(field))
     out["attempts"] = int(out.get("attempts") or 0)
     out["sell_origin"] = out.get("sell_origin") or ""
     out["last_error"] = out.get("last_error") or ""
-    for field in ("next_retry_at", "last_synced_at", "completed_at",
-                  "created_at", "updated_at"):
+    out["fee_other_currency"] = out.get("fee_other_currency") or ""
+    out["accounting_status"] = out.get("accounting_status") or "PENDING"
+    for field in _ORDER_TIMESTAMP_FIELDS:
         out[field] = _fmt_ts(out.get(field))
     return out
 
@@ -1247,8 +1389,12 @@ def _order_row(row) -> dict[str, Any]:
 def create_order_record(data: dict[str, Any]) -> dict[str, Any]:
     columns = [c for c in ORDER_COLUMNS if c not in ("id", "created_at", "updated_at")]
     now = datetime.now(UTC7).replace(tzinfo=None)
-    defaults = {"status": "PENDING", "filled_amount": 0, "attempts": 0,
-                "sell_origin": "", "last_error": ""}
+    defaults = {
+        "status": "PENDING", "filled_amount": 0, "attempts": 0,
+        "sell_origin": "", "last_error": "", "fee_base": 0, "fee_quote": 0,
+        "fee_other": 0, "fee_other_currency": "", "quote_spent": 0,
+        "trades_synced_filled": 0, "accounting_status": "PENDING",
+    }
     values = []
     for column in columns:
         value = data.get(column)
@@ -1327,6 +1473,86 @@ def list_orders(symbol: str | None = None, section_id: int | None = None,
     return out
 
 
+def list_filled_orders_between(start: Any, end: Any) -> list[dict[str, Any]]:
+    out = []
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
+                    WHERE status = 'FILLED'
+                      AND COALESCE(filled_at, last_synced_at, completed_at, created_at) >= %s
+                      AND COALESCE(filled_at, last_synced_at, completed_at, created_at) < %s
+                    ORDER BY COALESCE(filled_at, last_synced_at, completed_at, created_at), id""",
+                (start, end),
+            )
+            out = [_order_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("db list_filled_orders_between: %s", e)
+    return out
+
+
+def list_partial_orders_between(start: Any, end: Any) -> list[dict[str, Any]]:
+    out = []
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
+                    WHERE status <> 'FILLED'
+                      AND filled_amount > 0
+                      AND COALESCE(filled_at, last_synced_at, updated_at, created_at) >= %s
+                      AND COALESCE(filled_at, last_synced_at, updated_at, created_at) < %s
+                    ORDER BY COALESCE(filled_at, last_synced_at, updated_at, created_at), id""",
+                (start, end),
+            )
+            out = [_order_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("db list_partial_orders_between: %s", e)
+    return out
+
+
+def load_daily_report(report_date: Any) -> dict[str, Any] | None:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "SELECT report_date, status, sent_at, error FROM crypto_daily_reports WHERE report_date = %s",
+                (str(report_date),),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "report_date": str(row[0]),
+                "status": row[1] or "",
+                "sent_at": _fmt_ts(row[2]),
+                "error": row[3] or "",
+            }
+    except Exception as e:
+        logger.warning("db load_daily_report: %s", e)
+        return None
+
+
+def save_daily_report(report_date: Any, status: str = "SENT",
+                      error: str = "") -> None:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                """INSERT INTO crypto_daily_reports (report_date, status, sent_at, error)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (report_date) DO UPDATE SET
+                     status = EXCLUDED.status,
+                     sent_at = EXCLUDED.sent_at,
+                     error = EXCLUDED.error""",
+                (str(report_date), status, datetime.now(UTC7).replace(tzinfo=None),
+                 error or ""),
+            )
+    except Exception as e:
+        logger.warning("db save_daily_report: %s", e)
+
+
 def load_active_orders() -> list[dict[str, Any]]:
     out = []
     try:
@@ -1384,6 +1610,276 @@ def delete_order(task_id: int) -> None:
             cur.execute("DELETE FROM crypto_task_orders WHERE task_id = %s", (task_id,))
     except Exception as e:
         logger.warning("db delete_order: %s", e)
+
+
+# --------------- Section ledger / accounting ---------------
+
+def adjust_section_balances(section_id: int, base_delta: Any,
+                            quote_delta: Any) -> dict[str, Any]:
+    """Apply base/quote deltas to a section ledger. Clamps coin_qty at 0."""
+    result = {"coin_qty": "0", "quote_balance": "0", "clamped": False}
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "SELECT coin_qty, quote_balance FROM crypto_sections WHERE id = %s FOR UPDATE",
+                (section_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return result
+            coin = Decimal(str(row[0] or 0)) + Decimal(str(base_delta or 0))
+            quote = Decimal(str(row[1] or 0)) + Decimal(str(quote_delta or 0))
+            clamped = coin < 0
+            if clamped:
+                logger.warning("section %s oversell clamped to 0", section_id)
+                coin = Decimal(0)
+            cur.execute(
+                "UPDATE crypto_sections SET coin_qty = %s, quote_balance = %s WHERE id = %s",
+                (_dec_str(coin), _dec_str(quote), section_id),
+            )
+            result = {
+                "coin_qty": _dec_str(coin),
+                "quote_balance": _dec_str(quote),
+                "clamped": clamped,
+            }
+    except Exception as e:
+        logger.warning("db adjust_section_balances: %s", e)
+    return result
+
+
+def reserve_section_quote(section_id: int, amount: Any) -> bool:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "UPDATE crypto_sections SET quote_balance = quote_balance - %s "
+                "WHERE id = %s AND quote_balance >= %s RETURNING id",
+                (_dec_str(amount), section_id, _dec_str(amount)),
+            )
+            return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning("db reserve_section_quote: %s", e)
+        return False
+
+
+def add_section_quote(section_id: int, amount: Any) -> None:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "UPDATE crypto_sections SET quote_balance = quote_balance + %s WHERE id = %s",
+                (_dec_str(amount), section_id),
+            )
+    except Exception as e:
+        logger.warning("db add_section_quote: %s", e)
+
+
+def create_buy_task_reserving_quote(section_id: int, symbol: str, direction: str,
+                                    target_pct: float, note: str,
+                                    sell_origin: str = "",
+                                    spawn_key: str | None = None,
+                                    sibling_id: int | None = None
+                                    ) -> dict[str, Any] | None:
+    """Reserve the section's full free quote balance into a BUY task."""
+    if target_pct < -98 or target_pct > 98:
+        return None
+    try:
+        init_schema()
+        with _cursor() as cur:
+            if spawn_key:
+                cur.execute(f"{_TASK_SELECT} WHERE spawn_key = %s", (spawn_key,))
+                existing = cur.fetchone()
+                if existing is not None:
+                    return _task_row_to_dict(existing)
+            cur.execute(
+                "SELECT quote_balance FROM crypto_sections WHERE id = %s FOR UPDATE",
+                (section_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            budget = Decimal(str(row[0] or 0))
+            if budget <= 0:
+                return None
+            cur.execute(
+                "UPDATE crypto_sections SET quote_balance = 0 WHERE id = %s",
+                (section_id,),
+            )
+            cur.execute(
+                """INSERT INTO crypto_task_queue
+                   (symbol, direction, target_pct, action, note, sibling_id,
+                    sell_origin, section_id, quote_budget, spawn_key)
+                   VALUES (%s, %s, %s, 'BUY', %s, %s, %s, %s, %s, %s)
+                   RETURNING id, symbol, direction, target_pct, action, note,
+                             sibling_id, sell_origin, section_id, quote_budget, spawn_key""",
+                (symbol.strip().upper(), direction, target_pct, note, sibling_id,
+                 sell_origin, section_id, _dec_str(budget), spawn_key or None),
+            )
+            inserted = cur.fetchone()
+            if inserted is None and spawn_key:
+                cur.execute(f"{_TASK_SELECT} WHERE spawn_key = %s", (spawn_key,))
+                inserted = cur.fetchone()
+            if inserted is None:
+                return None
+            return _task_row_to_dict(inserted)
+    except Exception as e:
+        logger.warning("db create_buy_task_reserving_quote: %s", e)
+        return None
+
+
+def apply_order_accounting(task_id: int, base_delta: Any, quote_delta: Any,
+                           aggregates: dict[str, Any] | None = None) -> bool:
+    """Apply an order's ledger deltas exactly once. Returns True if applied."""
+    aggregates = aggregates or {}
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "SELECT section_id, accounting_applied_at FROM crypto_task_orders "
+                "WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            if row[1] is not None:
+                return False
+            section_id = row[0]
+            cur.execute(
+                "SELECT coin_qty, quote_balance FROM crypto_sections WHERE id = %s FOR UPDATE",
+                (section_id,),
+            )
+            sec = cur.fetchone()
+            if sec is None:
+                return False
+            coin = Decimal(str(sec[0] or 0)) + Decimal(str(base_delta or 0))
+            quote = Decimal(str(sec[1] or 0)) + Decimal(str(quote_delta or 0))
+            clamped = coin < 0
+            if clamped:
+                logger.warning("section %s oversell clamped to 0", section_id)
+                coin = Decimal(0)
+            cur.execute(
+                "UPDATE crypto_sections SET coin_qty = %s, quote_balance = %s WHERE id = %s",
+                (_dec_str(coin), _dec_str(quote), section_id),
+            )
+            status = str(aggregates.get("accounting_status") or "OK")
+            if clamped and status != "NEEDS_REVIEW":
+                status = "NEEDS_REVIEW"
+            cur.execute(
+                """UPDATE crypto_task_orders SET
+                     filled_base = COALESCE(%s, filled_base),
+                     filled_quote = COALESCE(%s, filled_quote),
+                     fee_base = %s,
+                     fee_quote = %s,
+                     fee_other = %s,
+                     fee_other_currency = %s,
+                     quote_spent = COALESCE(%s, quote_spent),
+                     accounting_status = %s,
+                     accounting_applied_at = %s,
+                     updated_at = %s
+                   WHERE task_id = %s""",
+                (
+                    _dec_str(aggregates.get("filled_base")),
+                    _dec_str(aggregates.get("filled_quote")),
+                    _dec_str(aggregates.get("fee_base") or 0),
+                    _dec_str(aggregates.get("fee_quote") or 0),
+                    _dec_str(aggregates.get("fee_other") or 0),
+                    aggregates.get("fee_other_currency") or "",
+                    _dec_str(aggregates.get("quote_spent")),
+                    status,
+                    datetime.now(UTC7).replace(tzinfo=None),
+                    datetime.now(UTC7).replace(tzinfo=None),
+                    task_id,
+                ),
+            )
+            return True
+    except Exception:
+        logger.exception("db apply_order_accounting failed")
+        raise
+
+
+def settle_buy_order(task_id: int) -> dict[str, Any] | None:
+    """Return leftover reserved quote to the section. Idempotent."""
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "SELECT section_id, quote_budget, quote_spent, quote_settled_at "
+                "FROM crypto_task_orders WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None or row[3] is not None:
+                return None
+            section_id = row[0]
+            budget = Decimal(str(row[1] or 0))
+            spent = Decimal(str(row[2] or 0))
+            leftover = budget - spent
+            if leftover < 0:
+                leftover = Decimal(0)
+            if leftover > 0:
+                cur.execute(
+                    "UPDATE crypto_sections SET quote_balance = quote_balance + %s WHERE id = %s",
+                    (_dec_str(leftover), section_id),
+                )
+            now = datetime.now(UTC7).replace(tzinfo=None)
+            if spent > budget:
+                cur.execute(
+                    "UPDATE crypto_task_orders SET quote_settled_at = %s, "
+                    "accounting_status = 'NEEDS_REVIEW', updated_at = %s WHERE task_id = %s",
+                    (now, now, task_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE crypto_task_orders SET quote_settled_at = %s, updated_at = %s "
+                    "WHERE task_id = %s",
+                    (now, now, task_id),
+                )
+            cur.execute(
+                "UPDATE crypto_task_queue SET quote_budget = 0 WHERE id = %s",
+                (task_id,),
+            )
+            return {"task_id": task_id, "released": _dec_str(leftover)}
+    except Exception:
+        logger.exception("db settle_buy_order failed")
+        raise
+
+
+def release_buy_task_budget(task_id: int) -> str | None:
+    """Release a BUY task's reserved quote when no order row exists."""
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM crypto_task_orders WHERE task_id = %s LIMIT 1",
+                (task_id,),
+            )
+            if cur.fetchone() is not None:
+                return None
+            cur.execute(
+                "SELECT section_id, action, quote_budget FROM crypto_task_queue "
+                "WHERE id = %s FOR UPDATE",
+                (task_id,),
+            )
+            row = cur.fetchone()
+            if row is None or str(row[1] or "").upper() != "BUY":
+                return None
+            budget = Decimal(str(row[2] or 0))
+            if budget <= 0:
+                return None
+            cur.execute(
+                "UPDATE crypto_sections SET quote_balance = quote_balance + %s WHERE id = %s",
+                (_dec_str(budget), row[0]),
+            )
+            cur.execute(
+                "UPDATE crypto_task_queue SET quote_budget = 0 WHERE id = %s",
+                (task_id,),
+            )
+            return _dec_str(budget)
+    except Exception as e:
+        logger.warning("db release_buy_task_budget: %s", e)
+        return None
 
 
 # --------------- Command Queue ---------------

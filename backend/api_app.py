@@ -43,12 +43,19 @@ from .config import (
     WORKER_HEARTBEAT_SEC,
 )
 from .fetcher import fetch_prices_dict
-from .settings_schema import FIELDS, normalize_settings, validate_settings
+from .settings_schema import (
+    FIELDS,
+    normalize_settings,
+    parse_coin_qty,
+    validate_settings,
+    validate_symbol,
+)
 from .store import (
     enqueue_command,
     get_command,
     load_all_settings,
     load_live_prices,
+    load_settings,
     load_worker_statuses,
     save_settings_config,
 )
@@ -274,12 +281,20 @@ def api_task_engine_settings_save():
     symbol = (data.get("symbol") or "").strip().upper()
     if not symbol:
         return jsonify({"error": "symbol is required"}), 400
+    symbol_error = validate_symbol(symbol)
+    if symbol_error:
+        return jsonify({"error": symbol_error}), 400
 
     updates = {field: data[field] for field in FIELDS
                if field in data and data[field] is not None}
-    error = validate_settings(updates, partial=True)
+    merged = normalize_settings(symbol, load_settings(symbol))
+    merged.update(updates)
+    error = validate_settings(merged, partial=False)
     if error:
         return jsonify({"error": error}), 400
+    for field in FIELDS:
+        if field in merged:
+            updates[field] = merged[field]
 
     try:
         saved = save_settings_config(symbol, updates)
@@ -362,14 +377,19 @@ def api_sections_create():
     symbol = (data.get("symbol") or "").strip().upper()
     name = (data.get("name") or "").strip()
     x0 = _float_value(data, "x0")
-    coin_qty = _float_value(data, "coin_qty") or 0.0
     if not symbol or not name or x0 is None:
         return jsonify({"error": "symbol, name, and x0 are required"}), 400
+    symbol_error = validate_symbol(symbol)
+    if symbol_error:
+        return jsonify({"error": symbol_error}), 400
+    coin_qty, qty_error = parse_coin_qty(data.get("coin_qty"))
+    if qty_error:
+        return jsonify({"error": qty_error}), 400
     return _enqueue(CREATE_SECTION, {
         "symbol": symbol,
         "name": name,
         "x0": x0,
-        "coin_qty": coin_qty,
+        "coin_qty": str(coin_qty),
         "request_id": str(uuid4()),
     })
 

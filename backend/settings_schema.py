@@ -3,7 +3,13 @@
 This module is safe to import from the thin VPS API: it contains no spawn or
 order logic.
 """
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
+
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
+COIN_QTY_PATTERN = re.compile(r"^\d+(\.\d{1,8})?$")
+MAX_COIN_QTY_DECIMALS = 8
 
 DEFAULT_SELL_DOWN_PCT = 50.0
 DEFAULT_SELL_UP_PCT = 50.0
@@ -38,6 +44,36 @@ DEFAULTS: dict[str, float] = {
     "grid_step_pct": DEFAULT_GRID_STEP_PCT,
     "buy_cancel_distance_pct": DEFAULT_BUY_CANCEL_DISTANCE_PCT,
 }
+
+
+def validate_symbol(symbol: Any) -> str | None:
+    """Return an error message for an invalid symbol, or None."""
+    text = str(symbol or "").strip().upper()
+    if not SYMBOL_PATTERN.match(text):
+        return "symbol must be 2-20 characters, uppercase letters and digits"
+    return None
+
+
+def parse_coin_qty(value: Any) -> tuple[Decimal | None, str | None]:
+    """Parse a section coin quantity. Returns (Decimal, error)."""
+    if value is None or isinstance(value, bool):
+        return None, "coin_qty must be a positive number"
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            text = format(Decimal(str(value)), "f")
+        except (InvalidOperation, ValueError):
+            return None, "coin_qty must be a positive number with at most 8 decimals"
+    else:
+        text = str(value).strip()
+    if not COIN_QTY_PATTERN.match(text):
+        return None, "coin_qty must be a positive number with at most 8 decimals"
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation:
+        return None, "coin_qty must be a positive number with at most 8 decimals"
+    if not parsed.is_finite() or parsed <= 0:
+        return None, "coin_qty must be > 0"
+    return parsed, None
 
 
 def _check(field: str, value: float) -> str | None:
@@ -77,6 +113,13 @@ def validate_settings(values: dict[str, Any], partial: bool = True) -> str | Non
         error = _check(field, value)
         if error:
             return error
+    if "sell_down_pct" in values and "sell_up_pct" in values:
+        try:
+            total = float(values.get("sell_down_pct")) + float(values.get("sell_up_pct"))
+        except (TypeError, ValueError):
+            return "sell_down_pct and sell_up_pct must be numbers"
+        if total > 100:
+            return "sell_down_pct + sell_up_pct must be <= 100"
     return None
 
 
