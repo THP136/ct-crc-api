@@ -49,7 +49,21 @@ def _get_pool():
         if _pool is not None:
             return _pool
         from psycopg2.pool import ThreadedConnectionPool
-        _pool = ThreadedConnectionPool(minconn=1, maxconn=5, dsn=_get_dsn())
+        # Bound every connection so a killed/interrupted request cannot leave a
+        # transaction holding DDL locks forever. Supabase/Supavisor may keep a
+        # backend "idle in transaction" after a client is killed; the idle
+        # timeout lets PostgreSQL clean it up.
+        _pool = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=5,
+            dsn=_get_dsn(),
+            connect_timeout=10,
+            options=(
+                "-c statement_timeout=25000 "
+                "-c lock_timeout=10000 "
+                "-c idle_in_transaction_session_timeout=15000"
+            ),
+        )
         atexit.register(_shutdown_pool)
         logger.info("DB connection pool created (min=1, max=5)")
         return _pool
@@ -72,18 +86,31 @@ def _cursor():
     try:
         cur = conn.cursor()
         try:
+            # Supavisor/Supabase may ignore libpq startup options, so enforce
+            # the bounds inside every transaction as well.
+            cur.execute(
+                "SET LOCAL statement_timeout = '25s'; "
+                "SET LOCAL lock_timeout = '10s'; "
+                "SET LOCAL idle_in_transaction_session_timeout = '15s'"
+            )
             yield cur
             conn.commit()
-        except Exception:
+        except BaseException:
+            # KeyboardInterrupt/SystemExit must not return an open transaction
+            # to the pool (it can hold DDL locks indefinitely).
             conn.rollback()
             raise
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
     finally:
         pool.putconn(conn)
 
 
 _schema_initialized = False
+_SCHEMA_LOCK_ID = 773311
 
 
 def init_schema() -> None:
@@ -91,6 +118,10 @@ def init_schema() -> None:
     if _schema_initialized:
         return
     with _cursor() as cur:
+        # Serialize migrations across API/worker processes. Without this,
+        # several processes running ALTER/CREATE INDEX can block each other
+        # and leave stale locks if one is killed mid-migration.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_task_engine_state (
                 symbol VARCHAR(20) PRIMARY KEY,
