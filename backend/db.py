@@ -111,6 +111,9 @@ def _cursor():
 
 _schema_initialized = False
 _SCHEMA_LOCK_ID = 773311
+# Bump this whenever the DDL below changes. Processes that see the current
+# version skip all DDL, keeping /health and worker startup fast.
+_SCHEMA_VERSION = "2026-10-27-1"
 
 
 def init_schema() -> None:
@@ -122,6 +125,17 @@ def init_schema() -> None:
         # several processes running ALTER/CREATE INDEX can block each other
         # and leave stale locks if one is killed mid-migration.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_ID,))
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_schema_meta (
+                id INTEGER PRIMARY KEY,
+                version VARCHAR(64) NOT NULL DEFAULT ''
+            );
+        """)
+        cur.execute("SELECT version FROM crypto_schema_meta WHERE id = 1")
+        version_row = cur.fetchone()
+        if version_row and version_row[0] == _SCHEMA_VERSION:
+            _schema_initialized = True
+            return
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_task_engine_state (
                 symbol VARCHAR(20) PRIMARY KEY,
@@ -418,6 +432,11 @@ def init_schema() -> None:
                 last_error TEXT DEFAULT ''
             );
         """)
+        cur.execute(
+            """INSERT INTO crypto_schema_meta (id, version) VALUES (1, %s)
+               ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version""",
+            (_SCHEMA_VERSION,),
+        )
     _schema_initialized = True
 
 
