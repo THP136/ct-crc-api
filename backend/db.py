@@ -1496,7 +1496,8 @@ def load_order_by_client_id(client_order_id: str) -> dict[str, Any] | None:
 
 
 def list_orders(symbol: str | None = None, section_id: int | None = None,
-                status: str | None = None) -> list[dict[str, Any]]:
+                status: str | None = None,
+                review_only: bool = False) -> list[dict[str, Any]]:
     out = []
     clauses = []
     params: list[Any] = []
@@ -1509,6 +1510,10 @@ def list_orders(symbol: str | None = None, section_id: int | None = None,
     if status:
         clauses.append("status = %s")
         params.append(status.strip().upper())
+    if review_only:
+        clauses.append(
+            "(status = 'NEEDS_REVIEW' OR accounting_status = 'NEEDS_REVIEW')"
+        )
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     try:
         init_schema()
@@ -1980,6 +1985,52 @@ def get_command(command_id: int) -> dict[str, Any] | None:
             return _command_row(row) if row else None
     except Exception as e:
         logger.warning("db get_command: %s", e)
+        return None
+
+
+def list_commands(status: str | None = None,
+                  limit: int = 100) -> list[dict[str, Any]]:
+    try:
+        init_schema()
+        limit = max(1, min(int(limit), 500))
+        with _cursor() as cur:
+            if status:
+                cur.execute(
+                    f"SELECT {', '.join(COMMAND_COLUMNS)} FROM crypto_commands "
+                    "WHERE status = %s ORDER BY id DESC LIMIT %s",
+                    (status.strip().upper(), limit),
+                )
+            else:
+                cur.execute(
+                    f"SELECT {', '.join(COMMAND_COLUMNS)} FROM crypto_commands "
+                    "ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+            return [_command_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("db list_commands: %s", e)
+        return []
+
+
+def requeue_command(command_id: int) -> dict[str, Any] | None:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute(
+                "UPDATE crypto_commands SET status = 'PENDING', result = NULL, "
+                "error = '', locked_by = NULL, locked_at = NULL, processed_at = NULL "
+                "WHERE id = %s AND status IN ('NEEDS_REVIEW', 'FAILED') RETURNING id",
+                (command_id,),
+            )
+            if cur.fetchone() is None:
+                return None
+            cur.execute(
+                f"SELECT {', '.join(COMMAND_COLUMNS)} FROM crypto_commands WHERE id = %s",
+                (command_id,),
+            )
+            return _command_row(cur.fetchone())
+    except Exception as e:
+        logger.warning("db requeue_command: %s", e)
         return None
 
 

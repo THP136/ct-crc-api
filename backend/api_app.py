@@ -53,10 +53,14 @@ from .settings_schema import (
 from .store import (
     enqueue_command,
     get_command,
+    list_commands,
     load_all_settings,
     load_live_prices,
+    load_order_by_task,
     load_settings,
     load_worker_statuses,
+    requeue_command,
+    requeue_order_review,
     save_settings_config,
 )
 
@@ -80,9 +84,14 @@ def cors(resp):
 
 def _protected_request() -> bool:
     path = request.path
-    if path in ("/api/task-engine/orders", "/api/task-engine/worker"):
+    if path in (
+        "/api/task-engine/orders",
+        "/api/task-engine/worker",
+        "/api/task-engine/commands",
+    ):
         return True
-    if path.startswith("/api/task-engine/orders/"):
+    if path.startswith(("/api/task-engine/orders/",
+                        "/api/task-engine/commands/")):
         return True
     return request.method in ("POST", "PUT", "PATCH", "DELETE") and path.startswith("/api/")
 
@@ -167,7 +176,9 @@ def index():
             "/api/task-engine/price-history",
             "/api/task-engine/commands",
             "/api/task-engine/commands/<id>",
+            "/api/task-engine/commands/<id>/retry",
             "/api/task-engine/orders",
+            "/api/task-engine/orders/<task_id>/resync",
             "/api/task-engine/worker",
         ],
     })
@@ -316,6 +327,21 @@ def api_enqueue_command():
     return _enqueue(command_type, payload)
 
 
+@app.route("/api/task-engine/commands", methods=["GET"])
+def api_list_commands():
+    status = (request.args.get("status") or "").strip().upper() or None
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        rows = list_commands(status=status, limit=limit)
+    except Exception as e:
+        logging.exception("list commands: %s", e)
+        return jsonify({"error": "Failed to list commands"}), 500
+    return jsonify({"commands": rows})
+
+
 @app.route("/api/task-engine/commands/<int:command_id>", methods=["GET"])
 def api_get_command(command_id):
     command = get_command(command_id)
@@ -324,17 +350,53 @@ def api_get_command(command_id):
     return jsonify(command)
 
 
+@app.route("/api/task-engine/commands/<int:command_id>/retry", methods=["POST"])
+def api_retry_command(command_id):
+    command = get_command(command_id)
+    if command is None:
+        return jsonify({"error": "Command not found"}), 404
+    if str(command.get("status") or "").upper() not in ("NEEDS_REVIEW", "FAILED"):
+        return jsonify({
+            "error": f"Command status {command.get('status')} cannot be retried"
+        }), 409
+    updated = requeue_command(command_id)
+    if updated is None:
+        return jsonify({"error": "Failed to queue command"}), 409
+    return jsonify({"ok": True, "command": updated})
+
+
+@app.route("/api/task-engine/orders/<int:task_id>/resync", methods=["POST"])
+def api_resync_order(task_id):
+    order = load_order_by_task(task_id)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+    status = str(order.get("status") or "").upper()
+    accounting = str(order.get("accounting_status") or "").upper()
+    if status != "NEEDS_REVIEW" and accounting != "NEEDS_REVIEW":
+        return jsonify({"error": "Order does not need review"}), 409
+    updated = requeue_order_review(task_id)
+    if updated is None:
+        return jsonify({"error": "Order not found"}), 404
+    return jsonify({"ok": True, "order": updated})
+
+
 @app.route("/api/task-engine/orders", methods=["GET"])
 def api_orders():
     from .store import list_orders
     symbol = (request.args.get("symbol") or "").strip().upper() or None
     status = (request.args.get("status") or "").strip().upper() or None
     section_id = request.args.get("section_id")
+    review_only = (request.args.get("review") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     try:
         section_id = int(section_id) if section_id is not None else None
     except (TypeError, ValueError):
         section_id = None
-    return jsonify({"orders": list_orders(symbol=symbol, section_id=section_id, status=status)})
+    return jsonify({"orders": list_orders(
+        symbol=symbol, section_id=section_id, status=status,
+        review_only=review_only,
+    )})
 
 
 @app.route("/api/task-engine/worker", methods=["GET"])

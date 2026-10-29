@@ -1107,10 +1107,12 @@ def load_order_by_client_id(client_order_id: str) -> dict[str, Any] | None:
 
 
 def list_orders(symbol: str | None = None, section_id: int | None = None,
-                status: str | None = None) -> list[dict[str, Any]]:
+                status: str | None = None,
+                review_only: bool = False) -> list[dict[str, Any]]:
     if _use_db():
         from .db import list_orders as _list
-        return _list(symbol=symbol, section_id=section_id, status=status)
+        return _list(symbol=symbol, section_id=section_id, status=status,
+                     review_only=review_only)
     recs = _load_json_file(TASK_ORDERS_FILE) or []
     out = []
     for row in recs:
@@ -1120,6 +1122,9 @@ def list_orders(symbol: str | None = None, section_id: int | None = None,
         if section_id is not None and rec.get("section_id") != section_id:
             continue
         if status and rec.get("status") != status.strip().upper():
+            continue
+        if review_only and rec.get("status") != "NEEDS_REVIEW" \
+                and rec.get("accounting_status") != "NEEDS_REVIEW":
             continue
         out.append(rec)
     return out
@@ -1250,6 +1255,30 @@ def delete_order(task_id: int) -> None:
     _save_json_file(TASK_ORDERS_FILE, recs)
 
 
+def requeue_order_review(task_id: int) -> dict[str, Any] | None:
+    """Send a NEEDS_REVIEW order back to the worker for reconciliation.
+
+    Only clears the review gate; it never edits balances. The worker fetches
+    the exchange order again and decides FILLED/CANCELED/NEEDS_REVIEW.
+    """
+    row = load_order_by_task(task_id)
+    if row is None:
+        return None
+    status = str(row.get("status") or "").upper()
+    accounting = str(row.get("accounting_status") or "").upper()
+    if status != "NEEDS_REVIEW" and accounting != "NEEDS_REVIEW":
+        return row
+    return update_order(
+        task_id,
+        status="UNKNOWN",
+        completed_at=None,
+        accounting_status="PENDING",
+        attempts=0,
+        next_retry_at=None,
+        last_error="manual resync",
+    )
+
+
 # --------------- Command Queue ---------------
 
 def enqueue_command(command_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1284,6 +1313,41 @@ def get_command(command_id: int) -> dict[str, Any] | None:
         return _get(command_id)
     commands = _load_json_file(COMMANDS_FILE) or []
     return next((c for c in commands if c.get("id") == command_id), None)
+
+
+def list_commands(status: str | None = None,
+                  limit: int = 100) -> list[dict[str, Any]]:
+    if _use_db():
+        from .db import list_commands as _list
+        return _list(status=status, limit=limit)
+    commands = _load_json_file(COMMANDS_FILE) or []
+    if status:
+        wanted = status.strip().upper()
+        commands = [c for c in commands if c.get("status") == wanted]
+    commands = sorted(commands, key=lambda c: c.get("id", 0), reverse=True)
+    return commands[:max(1, int(limit))]
+
+
+def requeue_command(command_id: int) -> dict[str, Any] | None:
+    """Put a FAILED/NEEDS_REVIEW command back in the PENDING queue."""
+    if _use_db():
+        from .db import requeue_command as _requeue
+        return _requeue(command_id)
+    commands = _load_json_file(COMMANDS_FILE) or []
+    for cmd in commands:
+        if cmd.get("id") != command_id:
+            continue
+        if cmd.get("status") not in ("NEEDS_REVIEW", "FAILED"):
+            return None
+        cmd["status"] = "PENDING"
+        cmd["result"] = None
+        cmd["error"] = ""
+        cmd["locked_by"] = None
+        cmd["locked_at"] = None
+        cmd["processed_at"] = None
+        _save_json_file(COMMANDS_FILE, commands)
+        return cmd
+    return None
 
 
 def claim_next_command(worker_id: str) -> dict[str, Any] | None:
