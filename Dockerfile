@@ -12,4 +12,4 @@ COPY backend ./backend
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "gunicorn --workers 1 --bind 0.0.0.0:${PORT:-8000} backend.api_app:app"]
+CMD ["sh", "-c", "gunicorn --workers 1 --worker-class gthread --threads 4 --timeout 60 --access-logfile - --error-logfile - --bind 0.0.0.0:${PORT:-8000} backend.api_app:app"]

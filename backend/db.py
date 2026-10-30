@@ -2115,6 +2115,18 @@ def save_worker_status(worker_id: str, mode: str, version: str = "",
         logger.warning("db save_worker_status: %s", e)
 
 
+def ping_db() -> bool:
+    try:
+        init_schema()
+        with _cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return True
+    except Exception as e:
+        logger.warning("db ping: %s", e)
+        return False
+
+
 def load_worker_statuses() -> list[dict[str, Any]]:
     out = []
     try:

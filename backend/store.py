@@ -1427,6 +1427,13 @@ def save_worker_status(worker_id: str, mode: str, version: str = "",
     _save_json_file(WORKER_STATUS_FILE, data)
 
 
+def ping_db() -> bool:
+    if _use_db():
+        from .db import ping_db as _ping
+        return _ping()
+    return True
+
+
 def load_worker_statuses() -> list[dict[str, Any]]:
     if _use_db():
         from .db import load_worker_statuses as _load

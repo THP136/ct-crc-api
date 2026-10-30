@@ -59,6 +59,7 @@ from .store import (
     load_order_by_task,
     load_settings,
     load_worker_statuses,
+    ping_db,
     requeue_command,
     requeue_order_review,
     save_settings_config,
@@ -160,6 +161,7 @@ def index():
         "app": "crypto-currency-thin-api",
         "endpoints": [
             "/health",
+            "/health/deep",
             "/api/price",
             "/api/task-engine/symbols",
             "/api/task-engine/init",
@@ -186,13 +188,34 @@ def index():
 
 @app.route("/health")
 def health():
-    try:
-        rows = load_worker_statuses()
-    except Exception as e:
-        logging.warning("health worker status: %s", e)
-        rows = []
+    """Liveness probe for Koyeb.
+
+    Must stay independent of the database: Koyeb kills the instance when this
+    request exceeds its short timeout, and a cold DB connection used to make
+    the whole deployment look unhealthy.
+    """
+    return jsonify({"ok": True, "service": "crypto-currency-thin-api"})
+
+
+@app.route("/health/deep")
+def health_deep():
+    """Readiness probe: database + worker heartbeat."""
+    db_ok = ping_db()
+    rows: list[dict] = []
+    if db_ok:
+        try:
+            rows = load_worker_statuses()
+        except Exception as e:
+            logging.warning("health deep worker status: %s", e)
+            db_ok = False
     online, workers = _worker_online(rows)
-    return jsonify({"ok": True, "worker_online": online, "workers": workers})
+    payload = {
+        "ok": db_ok,
+        "db_ok": db_ok,
+        "worker_online": online,
+        "workers": workers,
+    }
+    return jsonify(payload), (200 if db_ok else 503)
 
 
 @app.route("/api/price")
