@@ -1447,3 +1447,27 @@ def load_worker_status(worker_id: str) -> dict[str, Any] | None:
         if row.get("worker_id") == worker_id:
             return row
     return None
+
+
+def run_retention(commands_days: int = 7, tasks_days: int = 30,
+                  price_history_days: int = 7) -> dict[str, int]:
+    """Trim old history. DB mode delegates; JSON mode caps the lists."""
+    if _use_db():
+        from .db import run_retention as _run
+        return _run(commands_days=commands_days, tasks_days=tasks_days,
+                    price_history_days=price_history_days)
+
+    caps = {
+        TASK_PASSED_FILE: 500,
+        TASK_CLOSED_FILE: 500,
+        COMMANDS_FILE: 500,
+        PRICE_HISTORY_FILE: 2000,
+    }
+    deleted: dict[str, int] = {}
+    for path, cap in caps.items():
+        data = _load_json_file(path)
+        if not isinstance(data, list) or len(data) <= cap:
+            continue
+        deleted[path.name] = len(data) - cap
+        _save_json_file(path, data[:cap])
+    return deleted

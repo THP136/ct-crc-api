@@ -79,33 +79,59 @@ def _shutdown_pool():
         _pool = None
 
 
+# Supavisor (transaction pooling) drops the libpq startup ``options`` we pass to
+# ThreadedConnectionPool, so the bounds must be applied inside the transaction.
+# All three commands go out in ONE simple-query round trip instead of three
+# separate ones — that alone removes ~7M round trips per month.
+_LIMITS_SQL = (
+    "SET LOCAL statement_timeout = '25s'; "
+    "SET LOCAL lock_timeout = '10s'; "
+    "SET LOCAL idle_in_transaction_session_timeout = '15s'"
+)
+
+
 @contextmanager
-def _cursor():
+def _cursor(readonly: bool = False):
+    """Yield a cursor, committing on clean exit.
+
+    ``readonly=True`` runs the cursor in autocommit: a plain SELECT then costs
+    one round trip instead of BEGIN + SET LOCAL x3 + SELECT + COMMIT (six round
+    trips through the pooler). Read queries are still bounded by the server
+    default ``statement_timeout`` (2 min on Supabase).
+
+    Write paths keep the explicit transaction plus the timeouts, because a
+    half-applied ledger update must never be visible.
+    """
     pool = _get_pool()
     conn = pool.getconn()
+    was_autocommit = conn.autocommit
+    cur = None
     try:
+        if readonly:
+            conn.autocommit = True
         cur = conn.cursor()
-        try:
-            # Supavisor/Supabase may ignore libpq startup options, so enforce
-            # the bounds inside every transaction as well.
-            cur.execute(
-                "SET LOCAL statement_timeout = '25s'; "
-                "SET LOCAL lock_timeout = '10s'; "
-                "SET LOCAL idle_in_transaction_session_timeout = '15s'"
-            )
-            yield cur
+        if not readonly:
+            cur.execute(_LIMITS_SQL)
+        yield cur
+        if not readonly:
             conn.commit()
-        except BaseException:
-            # KeyboardInterrupt/SystemExit must not return an open transaction
-            # to the pool (it can hold DDL locks indefinitely).
+    except BaseException:
+        # KeyboardInterrupt/SystemExit must not return an open transaction
+        # to the pool (it can hold DDL locks indefinitely).
+        if not readonly:
             conn.rollback()
-            raise
-        finally:
+        raise
+    finally:
+        if cur is not None:
             try:
                 cur.close()
             except Exception:
                 pass
-    finally:
+        if readonly:
+            try:
+                conn.autocommit = was_autocommit
+            except Exception:
+                pass
         pool.putconn(conn)
 
 
@@ -113,7 +139,7 @@ _schema_initialized = False
 _SCHEMA_LOCK_ID = 773311
 # Bump this whenever the DDL below changes. Processes that see the current
 # version skip all DDL, keeping /health and worker startup fast.
-_SCHEMA_VERSION = "2026-10-27-1"
+_SCHEMA_VERSION = "2026-11-09-1"
 
 
 def init_schema() -> None:
@@ -422,6 +448,7 @@ def init_schema() -> None:
             );
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_commands_status ON crypto_commands(status, id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_crypto_commands_created_at ON crypto_commands(created_at);")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crypto_worker_status (
@@ -445,7 +472,7 @@ def init_schema() -> None:
 def load_task_engine_state(symbol: str) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT symbol, x0, current_x, current_pct, seeded, coin_qty FROM crypto_task_engine_state WHERE UPPER(symbol) = UPPER(%s)",
                 (symbol.strip(),),
@@ -498,7 +525,7 @@ def load_all_task_engine_symbols() -> list[str]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute("SELECT symbol FROM crypto_task_engine_state ORDER BY symbol")
             out = [row[0] for row in cur.fetchall()]
     except Exception as e:
@@ -512,7 +539,7 @@ def load_task_queue(symbol: str) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, quote_budget, spawn_key FROM crypto_task_queue WHERE UPPER(symbol) = UPPER(%s)",
                 (symbol.strip(),),
@@ -578,7 +605,7 @@ def update_task_sibling_id(task_id: int, sibling_id: int) -> None:
 def load_task_by_id(task_id: int) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, symbol, direction, target_pct, action, note, sibling_id, sell_origin, section_id, quote_budget, spawn_key "
                 "FROM crypto_task_queue WHERE id = %s",
@@ -659,7 +686,7 @@ def load_passed_tasks(symbol: str) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 """SELECT id, symbol, direction, action, target_pct, hit_pct, hit_price, note, created_at, task_id, sell_origin
                    FROM crypto_task_passed WHERE UPPER(symbol) = UPPER(%s) ORDER BY created_at DESC LIMIT 200""",
@@ -719,7 +746,7 @@ def load_closed_tasks(symbol: str) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 """SELECT id, symbol, closed_task_id, sibling_triggered_id,
                           direction, action, target_pct, at_pct, at_price,
@@ -787,7 +814,7 @@ def load_live_prices() -> dict[str, float]:
     out = {}
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute("SELECT symbol, price FROM crypto_live_prices")
             for row in cur.fetchall():
                 out[row[0]] = float(row[1])
@@ -806,7 +833,7 @@ def load_engine_info_batched(symbol: str) -> dict[str, Any]:
     try:
         init_schema()
         sym = symbol.strip()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT symbol, x0, current_x, current_pct, seeded, coin_qty FROM crypto_task_engine_state WHERE UPPER(symbol) = UPPER(%s)",
                 (sym,),
@@ -895,7 +922,7 @@ def _settings_row(row) -> dict[str, Any]:
 def load_settings(symbol: str) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT symbol, {', '.join(SETTINGS_COLUMNS)} FROM crypto_settings WHERE UPPER(symbol) = UPPER(%s)",
                 (symbol.strip(),),
@@ -942,7 +969,7 @@ def load_all_settings() -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT symbol, {', '.join(SETTINGS_COLUMNS)} FROM crypto_settings ORDER BY symbol"
             )
@@ -995,7 +1022,7 @@ def create_section(symbol: str, name: str, x0: float, coin_qty: float,
 def load_section_by_request_id(request_id: str) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded "
                 "FROM crypto_sections WHERE request_id = %s",
@@ -1020,7 +1047,7 @@ def load_sections(symbol: str | None = None) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             if symbol:
                 cur.execute(
                     "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE UPPER(symbol) = UPPER(%s) ORDER BY id",
@@ -1044,7 +1071,7 @@ def load_sections(symbol: str | None = None) -> list[dict[str, Any]]:
 def load_section(section_id: int) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
                 (section_id,),
@@ -1091,7 +1118,7 @@ def load_task_queue_by_section(section_id: int) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"{_TASK_SELECT} WHERE section_id = %s",
                 (section_id,),
@@ -1190,7 +1217,7 @@ def load_passed_tasks_by_section(section_id: int) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 """SELECT id, symbol, direction, action, target_pct, hit_pct, hit_price, note, created_at, task_id, sell_origin, section_id
                    FROM crypto_task_passed WHERE section_id = %s ORDER BY created_at DESC LIMIT 200""",
@@ -1241,7 +1268,7 @@ def load_closed_tasks_by_section(section_id: int) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 """SELECT id, symbol, closed_task_id, sibling_triggered_id,
                           direction, action, target_pct, at_pct, at_price,
@@ -1270,7 +1297,7 @@ def load_section_info_batched(section_id: int) -> dict[str, Any]:
     result: dict[str, Any] = {"section": None, "tasks": [], "passed": [], "closed": []}
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, name, symbol, x0, coin_qty, quote_balance, current_x, current_pct, seeded FROM crypto_sections WHERE id = %s",
                 (section_id,),
@@ -1350,7 +1377,7 @@ def load_price_history(symbol: str, limit: int = 20) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT id, symbol, price, created_at FROM crypto_price_history WHERE UPPER(symbol) = UPPER(%s) ORDER BY created_at DESC LIMIT %s",
                 (symbol.strip(), limit),
@@ -1468,7 +1495,7 @@ def create_order_record(data: dict[str, Any]) -> dict[str, Any]:
 def load_order_by_task(task_id: int) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders WHERE task_id = %s",
                 (task_id,),
@@ -1483,7 +1510,7 @@ def load_order_by_task(task_id: int) -> dict[str, Any] | None:
 def load_order_by_client_id(client_order_id: str) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders WHERE client_order_id = %s",
                 (client_order_id,),
@@ -1517,7 +1544,7 @@ def list_orders(symbol: str | None = None, section_id: int | None = None,
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders{where} ORDER BY id",
                 params,
@@ -1532,7 +1559,7 @@ def list_filled_orders_between(start: Any, end: Any) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
                     WHERE status = 'FILLED'
@@ -1551,7 +1578,7 @@ def list_partial_orders_between(start: Any, end: Any) -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
                     WHERE status <> 'FILLED'
@@ -1570,7 +1597,7 @@ def list_partial_orders_between(start: Any, end: Any) -> list[dict[str, Any]]:
 def load_daily_report(report_date: Any) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT report_date, status, sent_at, error FROM crypto_daily_reports WHERE report_date = %s",
                 (str(report_date),),
@@ -1612,7 +1639,7 @@ def load_active_orders() -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
                     WHERE status IN ('PENDING','OPEN','PARTIALLY_FILLED','UNKNOWN')
@@ -1628,7 +1655,7 @@ def load_uncompleted_filled_orders() -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"""SELECT {', '.join(ORDER_COLUMNS)} FROM crypto_task_orders
                     WHERE status = 'FILLED' AND completed_at IS NULL
@@ -1650,10 +1677,16 @@ def update_order(task_id: int, **fields: Any) -> dict[str, Any] | None:
     try:
         init_schema()
         with _cursor() as cur:
+            # RETURNING saves the follow-up SELECT: the order sync loop calls
+            # this several times per cycle, hundreds of times per hour.
             cur.execute(
-                f"UPDATE crypto_task_orders SET {assignments}, updated_at = %s WHERE task_id = %s",
+                f"UPDATE crypto_task_orders SET {assignments}, updated_at = %s "
+                f"WHERE task_id = %s RETURNING {', '.join(ORDER_COLUMNS)}",
                 params,
             )
+            row = cur.fetchone()
+            if row is not None:
+                return _order_row(row)
     except Exception as e:
         logger.warning("db update_order: %s", e)
     return load_order_by_task(task_id)
@@ -1976,7 +2009,7 @@ def enqueue_command(command_type: str, payload: dict[str, Any]) -> dict[str, Any
 def get_command(command_id: int) -> dict[str, Any] | None:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 f"SELECT {', '.join(COMMAND_COLUMNS)} FROM crypto_commands WHERE id = %s",
                 (command_id,),
@@ -1993,7 +2026,7 @@ def list_commands(status: str | None = None,
     try:
         init_schema()
         limit = max(1, min(int(limit), 500))
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             if status:
                 cur.execute(
                     f"SELECT {', '.join(COMMAND_COLUMNS)} FROM crypto_commands "
@@ -2118,7 +2151,7 @@ def save_worker_status(worker_id: str, mode: str, version: str = "",
 def ping_db() -> bool:
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
         return True
@@ -2131,7 +2164,7 @@ def load_worker_statuses() -> list[dict[str, Any]]:
     out = []
     try:
         init_schema()
-        with _cursor() as cur:
+        with _cursor(readonly=True) as cur:
             cur.execute(
                 "SELECT worker_id, last_seen, version, mode, last_error "
                 "FROM crypto_worker_status ORDER BY worker_id"
@@ -2147,3 +2180,79 @@ def load_worker_statuses() -> list[dict[str, Any]]:
     except Exception as e:
         logger.warning("db load_worker_statuses: %s", e)
     return out
+
+
+# --------------- Retention / maintenance ---------------
+
+_VACUUM_TABLES = (
+    "crypto_task_orders",
+    "crypto_task_queue",
+    "crypto_task_passed",
+    "crypto_task_closed",
+    "crypto_live_prices",
+    "crypto_commands",
+    "crypto_sections",
+    "crypto_worker_status",
+)
+
+
+def run_retention(commands_days: int = 7, tasks_days: int = 30,
+                  price_history_days: int = 7) -> dict[str, int]:
+    """Delete history that nothing reads any more, then VACUUM the hot tables.
+
+    The tables below used to grow forever (only the JSON fallback capped at 500
+    rows), which costs storage and makes every autovacuum pass slower. VACUUM
+    needs autocommit, hence the raw pooled connection instead of ``_cursor``.
+    """
+    deleted: dict[str, int] = {}
+    jobs = (
+        ("crypto_commands",
+         "DELETE FROM crypto_commands "
+         "WHERE status IN ('DONE','FAILED','NEEDS_REVIEW') "
+         "AND created_at < NOW() - make_interval(days => %s)",
+         commands_days),
+        ("crypto_task_passed",
+         "DELETE FROM crypto_task_passed "
+         "WHERE created_at < NOW() - make_interval(days => %s)",
+         tasks_days),
+        ("crypto_task_closed",
+         "DELETE FROM crypto_task_closed "
+         "WHERE created_at < NOW() - make_interval(days => %s)",
+         tasks_days),
+        ("crypto_price_history",
+         "DELETE FROM crypto_price_history "
+         "WHERE created_at < NOW() - make_interval(days => %s)",
+         price_history_days),
+        ("crypto_worker_status",
+         "DELETE FROM crypto_worker_status "
+         "WHERE last_seen < NOW() - make_interval(days => %s)",
+         tasks_days),
+    )
+    try:
+        init_schema()
+        pool = _get_pool()
+        conn = pool.getconn()
+        was_autocommit = conn.autocommit
+        try:
+            conn.autocommit = True
+            cur = conn.cursor()
+            try:
+                for name, sql, days in jobs:
+                    try:
+                        cur.execute(sql, (int(days),))
+                        deleted[name] = cur.rowcount or 0
+                    except Exception as e:
+                        logger.warning("retention %s: %s", name, e)
+                        deleted[name] = -1
+                try:
+                    cur.execute("VACUUM (ANALYZE) " + ", ".join(_VACUUM_TABLES))
+                except Exception as e:
+                    logger.warning("retention vacuum: %s", e)
+            finally:
+                cur.close()
+        finally:
+            conn.autocommit = was_autocommit
+            pool.putconn(conn)
+    except Exception as e:
+        logger.warning("db run_retention: %s", e)
+    return deleted

@@ -73,4 +73,4 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-WORKER_HEARTBEAT_SEC = float(os.getenv("WORKER_HEARTBEAT_SEC", "10").strip() or "10")
+WORKER_HEARTBEAT_SEC = float(os.getenv("WORKER_HEARTBEAT_SEC", "30").strip() or "30")
