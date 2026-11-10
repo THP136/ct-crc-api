@@ -52,5 +52,7 @@ jobs:
             exit 1
           fi
 
-          online_info=$(echo "$body" | jq -r '.workers[]? | "\(.worker_id) (last_seen: \(.last_seen), version: \(.version))"')
+          # Only workers the API itself marks online: the status table keeps
+          # retired rows forever, and printing one as "online" is misleading.
+          online_info=$(echo "$body" | jq -r '.workers[]? | select(.online == true) | "\(.worker_id) (last_seen: \(.last_seen), version: \(.version))"')
           echo "Worker online: $online_info"
