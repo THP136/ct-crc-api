@@ -1,0 +1,56 @@
+name: Worker watchdog
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check /health/deep
+        shell: bash
+        env:
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          if [ -z "$API_BASE_URL" ]; then
+            echo "::warning::API_BASE_URL is not set. Add it in Settings -> Secrets and variables -> Actions -> Variables."
+            exit 0
+          fi
+
+          URL="${API_BASE_URL%/}/health/deep"
+          echo "Checking $URL"
+
+          # No -f: /health/deep answers 503 when the DB is down, and that body is
+          # the only place that says *which* check failed.
+          code=$(curl -sS -o /tmp/health.json -w '%{http_code}' \
+                 --max-time 90 --retry 2 --retry-delay 10 --retry-connrefused "$URL") || code="000"
+          body=$(cat /tmp/health.json 2>/dev/null || true)
+          echo "HTTP $code"
+          echo "$body"
+
+          if [ -z "$body" ]; then
+            echo "::error::No response from $URL (HTTP $code)"
+            exit 1
+          fi
+
+          db_ok=$(echo "$body" | jq -r '.db_ok')
+          if [ "$db_ok" != "true" ]; then
+            echo "::error::Database check failed (db_ok=$db_ok)"
+            exit 1
+          fi
+
+          worker_online=$(echo "$body" | jq -r '.worker_online')
+          if [ "$worker_online" != "true" ]; then
+            workers_info=$(echo "$body" | jq -c '[.workers[]? | {worker_id, last_seen, version}]')
+            echo "::error::No worker online (worker_online=$worker_online). Workers: $workers_info"
+            exit 1
+          fi
+
+          online_info=$(echo "$body" | jq -r '.workers[]? | "\(.worker_id) (last_seen: \(.last_seen), version: \(.version))"')
+          echo "Worker online: $online_info"
